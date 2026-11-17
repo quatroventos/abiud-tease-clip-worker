@@ -16,6 +16,7 @@ app.use(express.json({ limit: '2mb' }));
 
 let busy = false;
 let currentJobId = null;
+let currentJob = null;
 
 function auth(req, res, next) {
   const header = String(req.headers.authorization || '');
@@ -48,7 +49,7 @@ async function callback(url, token, payload) {
   }
 }
 
-async function pandaGet(apiKey, path) {
+async function pandaGet(apiKey, path, { allow404 = false } = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { Authorization: apiKey, Accept: 'application/json' },
   });
@@ -58,6 +59,9 @@ async function pandaGet(apiKey, path) {
     data = JSON.parse(text);
   } catch {
     data = { raw: text };
+  }
+  if (res.status === 404 && allow404) {
+    return null;
   }
   if (!res.ok) {
     throw new Error(`Panda GET ${path} HTTP ${res.status}: ${text.slice(0, 300)}`);
@@ -100,6 +104,7 @@ function normalizeVideo(video) {
 
 async function downloadVideo(apiKey, downloadHost, internalId, destPath) {
   const url = `${downloadHost.replace(/\/$/, '')}/videos/${encodeURIComponent(internalId)}/auto/download`;
+  console.log('download start', internalId);
   const res = await fetch(url, {
     method: 'POST',
     headers: { Authorization: apiKey, Accept: '*/*' },
@@ -111,18 +116,27 @@ async function downloadVideo(apiKey, downloadHost, internalId, destPath) {
   await pipeline(res.body, createWriteStream(destPath));
   const st = await fs.stat(destPath);
   if (st.size < 1024) throw new Error('Download result too small');
+  console.log('download done bytes', st.size);
 }
 
-function runFfmpeg(args) {
+function runFfmpeg(args, onHeartbeat) {
   return new Promise((resolve, reject) => {
+    console.log('ffmpeg', args.join(' '));
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
+    const hb = setInterval(() => {
+      if (onHeartbeat) onHeartbeat();
+    }, 10000);
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
       if (stderr.length > 8000) stderr = stderr.slice(-8000);
     });
-    child.on('error', reject);
+    child.on('error', (err) => {
+      clearInterval(hb);
+      reject(err);
+    });
     child.on('close', (code) => {
+      clearInterval(hb);
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-500)}`));
     });
@@ -130,7 +144,7 @@ function runFfmpeg(args) {
 }
 
 async function uploadTus(apiKey, filePath, filename, folderId, videoId) {
-  const buf = await fs.readFile(filePath);
+  const st = await fs.stat(filePath);
   const meta = [
     `authorization ${Buffer.from(apiKey).toString('base64')}`,
     `filename ${Buffer.from(filename).toString('base64')}`,
@@ -140,6 +154,8 @@ async function uploadTus(apiKey, filePath, filename, folderId, videoId) {
     meta.push(`folder_id ${Buffer.from(folderId).toString('base64')}`);
   }
 
+  console.log('upload start', filename, 'bytes', st.size, 'video_id', videoId);
+  const buf = await fs.readFile(filePath);
   const res = await fetch(UPLOADER_URL, {
     method: 'POST',
     headers: {
@@ -157,15 +173,22 @@ async function uploadTus(apiKey, filePath, filename, folderId, videoId) {
     throw new Error(`Upload HTTP ${res.status}: ${text.slice(-400)}`);
   }
 
+  console.log('upload done', res.status, res.headers.get('location') || '');
   return { video_id: videoId, location: res.headers.get('location') || '' };
 }
 
 async function waitConverted(apiKey, videoId, onTick) {
-  for (let i = 0; i < 60; i++) {
-    if (onTick) onTick(i, 60);
-    const data = await pandaGet(apiKey, `/videos/${encodeURIComponent(videoId)}`);
+  for (let i = 0; i < 90; i++) {
+    if (onTick) onTick(i, 90);
+    const data = await pandaGet(apiKey, `/videos/${encodeURIComponent(videoId)}`, { allow404: true });
+    if (!data) {
+      console.log('convert wait 404', videoId, i + 1);
+      await new Promise((r) => setTimeout(r, 5000));
+      continue;
+    }
     const video = normalizeVideo(data);
     const status = video.status.toUpperCase();
+    console.log('convert status', status, video.video_external_id || '');
     if (status === 'CONVERTED' && video.video_external_id) return video;
     if (['FAILED', 'BLOCKED', 'DELETING'].includes(status)) {
       throw new Error(`Conversão falhou: ${status}`);
@@ -182,8 +205,6 @@ async function processJob(job) {
   const clip = join(workDir, 'tease.mp4');
   const notify = (stage, progress, message = '') =>
     callback(job.callback_url, job.callback_token, {
-      // job_id omitido nos updates intermediários: evita mismatch se o WP
-      // reenfileirou e trocou o meta enquanto este job ainda roda.
       post_id: job.post_id,
       status: 'processing',
       stage,
@@ -195,6 +216,7 @@ async function processJob(job) {
     await notify('resolve', 5, 'Resolvendo vídeo');
     const video = await findVideoByExternalId(job.panda_api_key, job.source_external_id);
     if (!video?.id) throw new Error(`Vídeo não encontrado: ${job.source_external_id}`);
+    console.log('source video', video.id, video.video_external_id);
 
     await notify('download', 15, 'Baixando');
     await downloadVideo(job.panda_api_key, job.download_host, video.id, src);
@@ -202,20 +224,32 @@ async function processJob(job) {
 
     const start = Math.max(0, Number(job.clip_start) || 0);
     const end = Math.max(start + 10, Number(job.clip_end) || start + 30);
+    const duration = Math.max(10, end - start);
     await notify('cut', 45, `Recortando ${start}s–${end}s`);
-    await runFfmpeg([
-      '-y',
-      '-i', src,
-      '-ss', String(start),
-      '-to', String(end),
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '23',
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-movflags', '+faststart',
-      clip,
-    ]);
+    // -ss antes do -i = seek rápido; -t = duração; ultrafast = corte leve.
+    let beat = 45;
+    await runFfmpeg(
+      [
+        '-y',
+        '-ss', String(start),
+        '-i', src,
+        '-t', String(duration),
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '28',
+        '-c:a', 'aac',
+        '-b:a', '96k',
+        '-ac', '2',
+        '-movflags', '+faststart',
+        clip,
+      ],
+      () => {
+        beat = Math.min(58, beat + 1);
+        notify('cut', beat, `Recortando ${start}s–${end}s…`);
+      }
+    );
+    const clipStat = await fs.stat(clip);
+    if (clipStat.size < 1024) throw new Error('Clip gerado muito pequeno');
     await notify('cut', 60, 'Recorte concluído');
 
     const newId = randomUUID();
@@ -243,6 +277,7 @@ async function processJob(job) {
       clip_seconds: end - start,
       message: 'Clip gerado',
     });
+    console.log('job ready', job.job_id, converted.video_external_id);
   } catch (err) {
     await callback(job.callback_url, job.callback_token, {
       post_id: job.post_id,
@@ -262,6 +297,7 @@ app.get('/health', (_req, res) => {
     ok: true,
     busy,
     current_job_id: currentJobId,
+    current_post_id: currentJob?.post_id || null,
     ffmpeg: true,
   });
 });
@@ -273,6 +309,7 @@ app.post('/v1/jobs', auth, async (req, res) => {
       error: 'busy',
       message: 'Worker ocupado (concurrency=1).',
       current_job_id: currentJobId,
+      current_post_id: currentJob?.post_id || null,
     });
   }
 
@@ -300,6 +337,7 @@ app.post('/v1/jobs', auth, async (req, res) => {
 
   busy = true;
   currentJobId = job.job_id;
+  currentJob = job;
   res.status(202).json({ ok: true, accepted: true, job_id: job.job_id });
 
   setImmediate(async () => {
@@ -310,8 +348,30 @@ app.post('/v1/jobs', auth, async (req, res) => {
     } finally {
       busy = false;
       currentJobId = null;
+      currentJob = null;
     }
   });
+});
+
+async function shutdown(signal) {
+  console.error('shutdown', signal, currentJobId);
+  if (currentJob) {
+    await callback(currentJob.callback_url, currentJob.callback_token, {
+      post_id: currentJob.post_id,
+      status: 'error',
+      stage: 'error',
+      progress: 0,
+      message: `Worker encerrado (${signal}) durante o job.`,
+    });
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => {
+  shutdown('SIGTERM');
+});
+process.on('SIGINT', () => {
+  shutdown('SIGINT');
 });
 
 app.listen(PORT, () => {
