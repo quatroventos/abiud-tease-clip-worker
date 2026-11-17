@@ -198,6 +198,39 @@ async function waitConverted(apiKey, videoId, onTick) {
   throw new Error('Timeout aguardando conversão na Panda');
 }
 
+function hlsUrl(libraryId, externalId) {
+  const lib = String(libraryId || '').replace(/^vz-/, 'vz-');
+  const uuid = String(externalId || '').toLowerCase();
+  if (!lib || !uuid) return '';
+  return `https://b-${lib}.tv.pandavideo.com.br/${uuid}/playlist.m3u8`;
+}
+
+async function cutClip({ input, start, duration, outPath, notify }) {
+  let beat = 20;
+  await runFfmpeg(
+    [
+      '-y',
+      '-ss', String(start),
+      '-i', input,
+      '-t', String(duration),
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-crf', '28',
+      '-c:a', 'aac',
+      '-b:a', '96k',
+      '-ac', '2',
+      '-movflags', '+faststart',
+      outPath,
+    ],
+    () => {
+      beat = Math.min(55, beat + 2);
+      notify('cut', beat, `Recortando ${start}s…`);
+    }
+  );
+  const st = await fs.stat(outPath);
+  if (st.size < 1024) throw new Error('Clip gerado muito pequeno');
+}
+
 async function processJob(job) {
   const workDir = join(tmpdir(), `abiud-tease-${job.job_id || randomUUID()}`);
   await fs.mkdir(workDir, { recursive: true });
@@ -213,47 +246,45 @@ async function processJob(job) {
     });
 
   try {
-    await notify('resolve', 5, 'Resolvendo vídeo');
-    const video = await findVideoByExternalId(job.panda_api_key, job.source_external_id);
-    if (!video?.id) throw new Error(`Vídeo não encontrado: ${job.source_external_id}`);
-    console.log('source video', video.id, video.video_external_id);
-
-    await notify('download', 15, 'Baixando');
-    await downloadVideo(job.panda_api_key, job.download_host, video.id, src);
-    await notify('download', 40, 'Download concluído');
-
     const start = Math.max(0, Number(job.clip_start) || 0);
     const end = Math.max(start + 10, Number(job.clip_end) || start + 30);
     const duration = Math.max(10, end - start);
-    await notify('cut', 45, `Recortando ${start}s–${end}s`);
-    // -ss antes do -i = seek rápido; -t = duração; ultrafast = corte leve.
-    let beat = 45;
-    await runFfmpeg(
-      [
-        '-y',
-        '-ss', String(start),
-        '-i', src,
-        '-t', String(duration),
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '28',
-        '-c:a', 'aac',
-        '-b:a', '96k',
-        '-ac', '2',
-        '-movflags', '+faststart',
-        clip,
-      ],
-      () => {
-        beat = Math.min(58, beat + 1);
-        notify('cut', beat, `Recortando ${start}s–${end}s…`);
+    const lib = job.library_id || '';
+    const ext = job.source_external_id;
+    const streamUrl = job.hls_url || hlsUrl(lib, ext);
+
+    await notify('resolve', 5, 'Resolvendo vídeo');
+    console.log('job start', job.job_id, 'post', job.post_id, 'hls', streamUrl);
+
+    // Caminho rápido: FFmpeg seek no HLS — só baixa ~trecho do clip.
+    let cutOk = false;
+    if (streamUrl) {
+      try {
+        await notify('cut', 15, `Cortando HLS ${start}s–${end}s`);
+        await cutClip({ input: streamUrl, start, duration, outPath: clip, notify });
+        cutOk = true;
+        console.log('hls cut ok');
+      } catch (err) {
+        console.error('hls cut failed, fallback download', err?.message || err);
+        await notify('download', 18, 'HLS falhou; baixando MP4…');
       }
-    );
-    const clipStat = await fs.stat(clip);
-    if (clipStat.size < 1024) throw new Error('Clip gerado muito pequeno');
+    }
+
+    if (!cutOk) {
+      const video = await findVideoByExternalId(job.panda_api_key, ext);
+      if (!video?.id) throw new Error(`Vídeo não encontrado: ${ext}`);
+      console.log('source video', video.id, video.video_external_id);
+      await notify('download', 20, 'Baixando MP4 completo');
+      await downloadVideo(job.panda_api_key, job.download_host, video.id, src);
+      await notify('download', 40, 'Download concluído');
+      await notify('cut', 45, `Recortando ${start}s–${end}s`);
+      await cutClip({ input: src, start, duration, outPath: clip, notify });
+    }
+
     await notify('cut', 60, 'Recorte concluído');
 
     const newId = randomUUID();
-    const filename = `tease-${job.post_id}-${job.source_external_id}.mp4`;
+    const filename = `tease-${job.post_id}-${ext}.mp4`;
     await notify('upload', 65, 'Enviando para Panda');
     await uploadTus(job.panda_api_key, clip, filename, job.folder_id || '', newId);
     await notify('upload', 80, 'Upload concluído');
@@ -271,7 +302,7 @@ async function processJob(job) {
       progress: 100,
       clip_external_id: converted.video_external_id,
       clip_internal_id: converted.id,
-      clip_lib: job.library_id || '',
+      clip_lib: lib || '',
       clip_start: start,
       clip_end: end,
       clip_seconds: end - start,
@@ -329,6 +360,7 @@ app.post('/v1/jobs', auth, async (req, res) => {
     clip_end: Number(body.clip_end ?? 160),
     folder_id: String(body.folder_id || ''),
     library_id: String(body.library_id || ''),
+    hls_url: String(body.hls_url || ''),
     callback_url: String(body.callback_url),
     callback_token: String(body.callback_token || ''),
     panda_api_key: String(body.panda_api_key),
