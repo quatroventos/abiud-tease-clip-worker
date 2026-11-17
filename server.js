@@ -231,7 +231,6 @@ async function processJob(job) {
     });
 
     await callback(job.callback_url, job.callback_token, {
-      job_id: job.job_id,
       post_id: job.post_id,
       status: 'ready',
       stage: 'ready',
@@ -246,7 +245,6 @@ async function processJob(job) {
     });
   } catch (err) {
     await callback(job.callback_url, job.callback_token, {
-      job_id: job.job_id,
       post_id: job.post_id,
       status: 'error',
       stage: 'error',
