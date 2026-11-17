@@ -119,24 +119,43 @@ async function downloadVideo(apiKey, downloadHost, internalId, destPath) {
   console.log('download done bytes', st.size);
 }
 
-function runFfmpeg(args, onHeartbeat) {
+function runFfmpeg(args, { onHeartbeat = null, timeoutMs = 180000 } = {}) {
   return new Promise((resolve, reject) => {
     console.log('ffmpeg', args.join(' '));
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
+    let settled = false;
     const hb = setInterval(() => {
       if (onHeartbeat) onHeartbeat();
-    }, 10000);
+    }, 5000);
+    const killer = setTimeout(() => {
+      if (settled) return;
+      console.error('ffmpeg timeout, killing');
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      settled = true;
+      clearInterval(hb);
+      reject(new Error(`ffmpeg timeout ${timeoutMs}ms: ${stderr.slice(-500)}`));
+    }, timeoutMs);
     child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
       if (stderr.length > 8000) stderr = stderr.slice(-8000);
     });
     child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
       clearInterval(hb);
+      clearTimeout(killer);
       reject(err);
     });
     child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       clearInterval(hb);
+      clearTimeout(killer);
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-500)}`));
     });
@@ -206,9 +225,44 @@ function hlsUrl(libraryId, externalId) {
 }
 
 async function cutClip({ input, start, duration, outPath, notify }) {
-  let beat = 20;
+  let beat = 45;
+  const pulse = (msg) => {
+    beat = Math.min(58, beat + 1);
+    if (notify) notify('cut', beat, msg);
+  };
+
+  // 1) Remux (-c copy): segundos, quase sem CPU. É o que evita o travão em 45%.
+  try {
+    pulse(`Cortando (copy) ${start}s…`);
+    await runFfmpeg(
+      [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-y',
+        '-ss', String(start),
+        '-i', input,
+        '-t', String(duration),
+        '-c', 'copy',
+        '-avoid_negative_ts', 'make_zero',
+        outPath,
+      ],
+      { onHeartbeat: () => pulse(`Cortando (copy) ${start}s…`), timeoutMs: 90000 }
+    );
+    const st = await fs.stat(outPath);
+    if (st.size < 1024) throw new Error('Clip copy muito pequeno');
+    console.log('cut copy ok bytes', st.size);
+    return;
+  } catch (err) {
+    console.error('cut copy failed, reencode', err?.message || err);
+    await fs.rm(outPath, { force: true }).catch(() => {});
+  }
+
+  // 2) Fallback reencode rápido, com timeout duro.
+  pulse(`Cortando (reencode) ${start}s…`);
   await runFfmpeg(
     [
+      '-hide_banner',
+      '-loglevel', 'error',
       '-y',
       '-ss', String(start),
       '-i', input,
@@ -222,13 +276,11 @@ async function cutClip({ input, start, duration, outPath, notify }) {
       '-movflags', '+faststart',
       outPath,
     ],
-    () => {
-      beat = Math.min(55, beat + 2);
-      notify('cut', beat, `Recortando ${start}s…`);
-    }
+    { onHeartbeat: () => pulse(`Cortando (reencode) ${start}s…`), timeoutMs: 180000 }
   );
-  const st = await fs.stat(outPath);
-  if (st.size < 1024) throw new Error('Clip gerado muito pequeno');
+  const st2 = await fs.stat(outPath);
+  if (st2.size < 1024) throw new Error('Clip gerado muito pequeno');
+  console.log('cut reencode ok bytes', st2.size);
 }
 
 async function processJob(job) {
