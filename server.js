@@ -29,7 +29,7 @@ function auth(req, res, next) {
 async function callback(url, token, payload) {
   if (!url) return;
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -37,6 +37,12 @@ async function callback(url, token, payload) {
       },
       body: JSON.stringify(payload),
     });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.error('callback HTTP', res.status, payload?.stage || '', text.slice(0, 200));
+    } else {
+      console.log('callback ok', payload?.status, payload?.stage, payload?.progress);
+    }
   } catch (err) {
     console.error('callback failed', err?.message || err);
   }
@@ -176,7 +182,8 @@ async function processJob(job) {
   const clip = join(workDir, 'tease.mp4');
   const notify = (stage, progress, message = '') =>
     callback(job.callback_url, job.callback_token, {
-      job_id: job.job_id,
+      // job_id omitido nos updates intermediários: evita mismatch se o WP
+      // reenfileirou e trocou o meta enquanto este job ainda roda.
       post_id: job.post_id,
       status: 'processing',
       stage,
