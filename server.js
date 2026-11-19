@@ -8,15 +8,15 @@ import { randomUUID } from 'node:crypto';
 
 const PORT = Number(process.env.PORT || 8080);
 const WORKER_TOKEN = String(process.env.WORKER_TOKEN || '').trim();
+const CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.CONCURRENCY || 3) || 3));
 const UPLOADER_URL = 'https://uploader.pandavideo.com/files/';
 const API_BASE = 'https://api-v2.pandavideo.com.br';
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-let busy = false;
-let currentJobId = null;
-let currentJob = null;
+let activeCount = 0;
+const activeJobs = new Map(); // job_id -> job
 
 function auth(req, res, next) {
   const header = String(req.headers.authorization || '');
@@ -202,7 +202,7 @@ async function waitConverted(apiKey, videoId, onTick) {
     const data = await pandaGet(apiKey, `/videos/${encodeURIComponent(videoId)}`, { allow404: true });
     if (!data) {
       console.log('convert wait 404', videoId, i + 1);
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 2000));
       continue;
     }
     const video = normalizeVideo(data);
@@ -212,7 +212,7 @@ async function waitConverted(apiKey, videoId, onTick) {
     if (['FAILED', 'BLOCKED', 'DELETING'].includes(status)) {
       throw new Error(`Conversão falhou: ${status}`);
     }
-    await new Promise((r) => setTimeout(r, 5000));
+    await new Promise((r) => setTimeout(r, 2000));
   }
   throw new Error('Timeout aguardando conversão na Panda');
 }
@@ -367,23 +367,34 @@ async function processJob(job) {
 }
 
 app.get('/health', (_req, res) => {
+  const jobs = Array.from(activeJobs.values()).map((j) => ({
+    job_id: j.job_id,
+    post_id: j.post_id,
+  }));
   res.json({
     ok: true,
-    busy,
-    current_job_id: currentJobId,
-    current_post_id: currentJob?.post_id || null,
+    busy: activeCount >= CONCURRENCY,
+    active: activeCount,
+    concurrency: CONCURRENCY,
+    current_job_id: jobs[0]?.job_id || null,
+    current_post_id: jobs[0]?.post_id || null,
+    jobs,
     ffmpeg: true,
   });
 });
 
 app.post('/v1/jobs', auth, async (req, res) => {
-  if (busy) {
+  if (activeCount >= CONCURRENCY) {
     return res.status(409).json({
       ok: false,
       error: 'busy',
-      message: 'Worker ocupado (concurrency=1).',
-      current_job_id: currentJobId,
-      current_post_id: currentJob?.post_id || null,
+      message: `Worker ocupado (concurrency=${CONCURRENCY}, active=${activeCount}).`,
+      active: activeCount,
+      concurrency: CONCURRENCY,
+      jobs: Array.from(activeJobs.values()).map((j) => ({
+        job_id: j.job_id,
+        post_id: j.post_id,
+      })),
     });
   }
 
@@ -410,13 +421,18 @@ app.post('/v1/jobs', auth, async (req, res) => {
     download_host: String(body.download_host),
   };
 
-  busy = true;
-  currentJobId = job.job_id;
-  currentJob = job;
-  res.status(202).json({ ok: true, accepted: true, job_id: job.job_id });
+  activeCount += 1;
+  activeJobs.set(job.job_id, job);
+  console.log('job accepted', job.job_id, 'post', job.post_id, `active ${activeCount}/${CONCURRENCY}`);
+  res.status(202).json({
+    ok: true,
+    accepted: true,
+    job_id: job.job_id,
+    active: activeCount,
+    concurrency: CONCURRENCY,
+  });
 
-  // Libera busy ANTES do callback final ready/error para o WP poder encadear o próximo
-  // job sem tomar 409 (fila avançar sem a página admin aberta).
+  // Libera slot ANTES do callback final ready/error para o WP poder encadear o próximo.
   setImmediate(async () => {
     let result;
     try {
@@ -426,9 +442,9 @@ app.post('/v1/jobs', auth, async (req, res) => {
       console.error('job failed', job.job_id, err?.message || err);
     }
 
-    busy = false;
-    currentJobId = null;
-    currentJob = null;
+    activeJobs.delete(job.job_id);
+    activeCount = Math.max(0, activeCount - 1);
+    console.log('job slot free', job.job_id, `active ${activeCount}/${CONCURRENCY}`);
 
     if (result && result.ok) {
       const converted = result.converted;
@@ -462,10 +478,12 @@ app.post('/v1/jobs', auth, async (req, res) => {
 });
 
 async function shutdown(signal) {
-  console.error('shutdown', signal, currentJobId);
-  if (currentJob) {
-    await callback(currentJob.callback_url, currentJob.callback_token, {
-      post_id: currentJob.post_id,
+  console.error('shutdown', signal, Array.from(activeJobs.keys()));
+  const jobs = Array.from(activeJobs.values());
+  for (const job of jobs) {
+    await callback(job.callback_url, job.callback_token, {
+      job_id: job.job_id,
+      post_id: job.post_id,
       status: 'error',
       stage: 'error',
       progress: 0,
@@ -483,5 +501,5 @@ process.on('SIGINT', () => {
 });
 
 app.listen(PORT, () => {
-  console.log(`abiud-tease-clip-worker on :${PORT}`);
+  console.log(`abiud-tease-clip-worker on :${PORT} concurrency=${CONCURRENCY}`);
 });
