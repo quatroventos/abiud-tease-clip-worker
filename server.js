@@ -290,6 +290,7 @@ async function processJob(job) {
   const clip = join(workDir, 'tease.mp4');
   const notify = (stage, progress, message = '') =>
     callback(job.callback_url, job.callback_token, {
+      job_id: job.job_id,
       post_id: job.post_id,
       status: 'processing',
       stage,
@@ -347,29 +348,19 @@ async function processJob(job) {
       notify('convert', Math.min(96, pct), `Convertendo (${attempt + 1}/${max})`);
     });
 
-    await callback(job.callback_url, job.callback_token, {
-      post_id: job.post_id,
-      status: 'ready',
-      stage: 'ready',
-      progress: 100,
-      clip_external_id: converted.video_external_id,
-      clip_internal_id: converted.id,
-      clip_lib: lib || '',
-      clip_start: start,
-      clip_end: end,
-      clip_seconds: end - start,
-      message: 'Clip gerado',
-    });
     console.log('job ready', job.job_id, converted.video_external_id);
+    return {
+      ok: true,
+      start,
+      end,
+      lib,
+      converted,
+    };
   } catch (err) {
-    await callback(job.callback_url, job.callback_token, {
-      post_id: job.post_id,
-      status: 'error',
-      stage: 'error',
-      progress: 0,
-      message: err?.message || String(err),
-    });
-    throw err;
+    return {
+      ok: false,
+      error: err?.message || String(err),
+    };
   } finally {
     await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -424,15 +415,48 @@ app.post('/v1/jobs', auth, async (req, res) => {
   currentJob = job;
   res.status(202).json({ ok: true, accepted: true, job_id: job.job_id });
 
+  // Libera busy ANTES do callback final ready/error para o WP poder encadear o próximo
+  // job sem tomar 409 (fila avançar sem a página admin aberta).
   setImmediate(async () => {
+    let result;
     try {
-      await processJob(job);
+      result = await processJob(job);
     } catch (err) {
+      result = { ok: false, error: err?.message || String(err) };
       console.error('job failed', job.job_id, err?.message || err);
-    } finally {
-      busy = false;
-      currentJobId = null;
-      currentJob = null;
+    }
+
+    busy = false;
+    currentJobId = null;
+    currentJob = null;
+
+    if (result && result.ok) {
+      const converted = result.converted;
+      await callback(job.callback_url, job.callback_token, {
+        job_id: job.job_id,
+        post_id: job.post_id,
+        status: 'ready',
+        stage: 'ready',
+        progress: 100,
+        clip_external_id: converted.video_external_id,
+        clip_internal_id: converted.id,
+        clip_lib: result.lib || '',
+        clip_start: result.start,
+        clip_end: result.end,
+        clip_seconds: result.end - result.start,
+        message: 'Clip gerado',
+      });
+    } else {
+      const message = (result && result.error) || 'Erro no worker';
+      console.error('job failed', job.job_id, message);
+      await callback(job.callback_url, job.callback_token, {
+        job_id: job.job_id,
+        post_id: job.post_id,
+        status: 'error',
+        stage: 'error',
+        progress: 0,
+        message,
+      });
     }
   });
 });
