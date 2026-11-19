@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 
 const PORT = Number(process.env.PORT || 8080);
 const WORKER_TOKEN = String(process.env.WORKER_TOKEN || '').trim();
-const CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.CONCURRENCY || 3) || 3));
+const CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.CONCURRENCY || 1) || 1));
 const UPLOADER_URL = 'https://uploader.pandavideo.com/files/';
 const API_BASE = 'https://api-v2.pandavideo.com.br';
 
